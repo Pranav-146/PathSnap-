@@ -1,0 +1,6 @@
+trip_id,split,num_gps_points,num_gt_arcs,hmm_f1,baseline_f1,hmm_continuity,baseline_continuity,continuity_gain,in_route_acc,miss_rate,inference_time_s
+00000001,train,1315,525,88.73,71.96,86.32,43.74,42.58,97.03,0.152,0.75
+00000002,train,7243,262,59.12,47.13,92.89,34.93,57.96,58.42,12.136,1.19
+00000003,train,821,79,77.32,58.3,75.62,22.76,52.86,76.25,0.853,0.31
+00000000,student_test,2503,179,91.35,50.57,93.64,56.14,37.51,96.2,0.2,0.26
+00000007,student_test,1354,123,97.98,56.34,100.0,62.41,37.59,93.13,0.0,0.11
