@@ -99,6 +99,28 @@ def trajectory_plots(trip_ids):
     fig.savefig(OUT / "trajectories.png", dpi=130); plt.close(fig)
 
 
+def network_plot(trip_id, split_dir):
+    """Static road-network view: all arcs near the track (grey), reference route (green), GPS (blue)."""
+    from matplotlib.collections import LineCollection
+    t = load_trip(split_dir / trip_id)
+    ax_, ay_, bx_, by_ = arc_endpoints(t)
+    px, py = t["track"].x.to_numpy(), t["track"].y.to_numpy()
+    m = 300.0                                         # margin around the GPS bounding box, metres
+    near = ((np.maximum(ax_, bx_) >= px.min() - m) & (np.minimum(ax_, bx_) <= px.max() + m) &
+            (np.maximum(ay_, by_) >= py.min() - m) & (np.minimum(ay_, by_) <= py.max() + m))
+    segs = np.stack([np.column_stack([ax_[near], ay_[near]]), np.column_stack([bx_[near], by_[near]])], axis=1)
+    r = t["route"]
+    rsegs = np.stack([np.column_stack([ax_[r], ay_[r]]), np.column_stack([bx_[r], by_[r]])], axis=1)
+    fig, ax = plt.subplots(figsize=(7.5, 7))
+    ax.add_collection(LineCollection(segs, colors="#9a9a9a", linewidths=0.6, label=f"road network ({int(near.sum())} arcs)"))
+    ax.add_collection(LineCollection(rsegs, colors="#1a8f3c", linewidths=1.3, zorder=4, label=f"reference route ({len(r)} arcs)"))
+    ax.scatter(px, py, s=14, color="#1f4fd8", alpha=0.45, label=f"raw GPS ({len(px)} points)", zorder=3)
+    ax.set_xlim(px.min() - m, px.max() + m); ax.set_ylim(py.min() - m, py.max() + m)
+    ax.set_aspect("equal"); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)"); ax.legend(loc="best")
+    ax.set_title(f"Road network around trip {trip_id} (student_test)")
+    fig.tight_layout(); fig.savefig(OUT / "road_network.png", dpi=130); plt.close(fig)
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     inv, gaps = build_inventory()
@@ -127,6 +149,7 @@ def main():
     plots(inv, gaps, labels)
     pick = inv[(inv.split == "train")].sort_values("n_points").trip_id.iloc[[len(inv[inv.split == "train"]) // 4, len(inv[inv.split == "train"]) // 2, -30]].tolist()
     trajectory_plots(pick)
+    network_plot("00000007", config.STUDTEST_DIR)
     print("trajectory trips:", pick, "\nwrote", OUT)
 
 
