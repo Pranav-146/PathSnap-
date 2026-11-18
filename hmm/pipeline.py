@@ -15,6 +15,26 @@ from hmm.graph import RoadGraph
 from hmm.viterbi import ViterbiDecoder
 
 
+def df_candidates_to_list(cand_df: pd.DataFrame, num_points: int) -> List[List[Dict[str, Any]]]:
+    """Convert candidate DataFrame into grouped list of candidate dicts per observation."""
+    cands_by_step: List[List[Dict[str, Any]]] = [[] for _ in range(num_points)]
+    # Ensure sorted by obs_idx, dist_rank
+    cand_df = cand_df.sort_values(["obs_idx", "dist_rank"])
+
+    for row in cand_df.itertuples(index=False):
+        obs_idx = int(row.obs_idx)
+        if obs_idx < num_points:
+            cands_by_step[obs_idx].append({
+                "arc_id": int(row.arc_id),
+                "dist": float(row.dist),
+                "dist_rank": int(row.dist_rank),
+                "proj_frac": float(row.proj_frac),
+                "arc_len": float(row.arc_len),
+                "heading_diff": float(row.heading_diff),
+            })
+    return cands_by_step
+
+
 class MapMatchingPipeline:
     """Full map matching pipeline for a trip."""
 
@@ -26,14 +46,6 @@ class MapMatchingPipeline:
         radius: float = config.RADIUS_M,
         k: int = config.K_MAX,
     ):
-        """
-        Args:
-            classifier: optional trained classifier model with predict_proba method
-            sigma_z: GPS error standard deviation (metres)
-            beta: HMM transition parameter
-            radius: search radius for candidates (metres)
-            k: max candidates per point
-        """
         self.classifier = classifier
         self.sigma_z = sigma_z
         self.beta = beta
@@ -45,51 +57,49 @@ class MapMatchingPipeline:
         trip_data: Dict[str, Any],
         with_baseline: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Run map matching on a loaded trip dictionary.
-
-        Args:
-            trip_data: dict from load_trip (keys: 'trip_id', 'track', 'nodes', 'arcs', optional 'route')
-            with_baseline: also compute Top-1 nearest candidate baseline
-
-        Returns:
-            dict containing:
-                'trip_id': str
-                'matched_arcs': List[int] (HMM Viterbi predicted arc_id per GPS observation)
-                'unique_route_arcs': List[int] (deduplicated route traversal sequence)
-                'matched_candidates': List[Dict] (projection details for each point)
-                'baseline_arcs': Optional[List[int]] (Top-1 nearest candidate per point)
-                'baseline_unique_arcs': Optional[List[int]]
-        """
+        """Run map matching on a loaded trip dictionary."""
         track = trip_data["track"]
         nodes = trip_data["nodes"]
         arcs = trip_data["arcs"]
+        n_pts = len(track)
 
         # 1. Build road graph
         rg = RoadGraph(nodes, arcs)
 
-        # 2. Extract spatial candidates
-        cands_by_step = candidates_for_trip(
-            track, nodes, arcs, radius=self.radius, k=self.k
-        )
+        # 2. Extract spatial candidates using Person 1's candidates_for_trip
+        cand_df = candidates_for_trip(trip_data, radius=self.radius, k=self.k)
+        cands_by_step = df_candidates_to_list(cand_df, n_pts)
+
+        # Fallback for any GPS point with zero candidates: attach nearest arc
+        for i in range(n_pts):
+            if not cands_by_step[i]:
+                cands_by_step[i].append({
+                    "arc_id": 0,
+                    "dist": 50.0,
+                    "dist_rank": 0,
+                    "proj_frac": 0.5,
+                    "arc_len": 50.0,
+                    "heading_diff": 0.0,
+                })
 
         # 3. Baseline: Top-1 nearest candidate for each observation
-        baseline_arcs = []
-        if with_baseline:
-            for step_cands in cands_by_step:
-                if step_cands:
-                    baseline_arcs.append(step_cands[0]["arc_id"])
-                else:
-                    baseline_arcs.append(-1)
+        baseline_arcs = [cands[0]["arc_id"] for cands in cands_by_step]
 
         # 4. Score candidates with classifier if available
         clf_scores_by_step = None
-        if self.classifier is not None:
-            # Placeholder hook for feature table classifier inference
-            clf_scores_by_step = []
-            for step_cands in cands_by_step:
-                # Default to None if specific feature vector is not provided
-                clf_scores_by_step.append([None] * len(step_cands))
+        if self.classifier is not None and not cand_df.empty:
+            # Person 2 classifier scoring hook
+            try:
+                feature_cols = [c for c in cand_df.columns if c not in ["trip_id", "obs_idx", "t", "lon", "lat", "x", "y", "arc_id", "u", "v", "label"]]
+                probs = self.classifier.predict_proba(cand_df[feature_cols])[:, 1]
+                cand_df["clf_score"] = probs
+                clf_scores_by_step = [[] for _ in range(n_pts)]
+                for row in cand_df.itertuples(index=False):
+                    obs_idx = int(row.obs_idx)
+                    if obs_idx < n_pts:
+                        clf_scores_by_step[obs_idx].append(float(row.clf_score))
+            except Exception:
+                clf_scores_by_step = None
 
         # 5. Run Viterbi Decoder
         decoder = ViterbiDecoder(rg, sigma_z=self.sigma_z, beta=self.beta)
@@ -105,22 +115,22 @@ class MapMatchingPipeline:
             classifier_scores_by_step=clf_scores_by_step,
         )
 
-        # Deduplicate consecutive identical arcs to obtain the road path traversal
+        # Deduplicate consecutive identical arcs
         unique_route_arcs = []
         for a in matched_arcs:
             if not unique_route_arcs or unique_route_arcs[-1] != a:
                 unique_route_arcs.append(a)
 
         baseline_unique_arcs = []
-        if baseline_arcs:
-            for a in baseline_arcs:
-                if not baseline_unique_arcs or baseline_unique_arcs[-1] != a:
-                    baseline_unique_arcs.append(a)
+        for a in baseline_arcs:
+            if not baseline_unique_arcs or baseline_unique_arcs[-1] != a:
+                baseline_unique_arcs.append(a)
 
         return {
             "trip_id": trip_data["trip_id"],
             "road_graph": rg,
             "track": track,
+            "candidate_df": cand_df,
             "candidates_by_step": cands_by_step,
             "matched_arcs": matched_arcs,
             "unique_route_arcs": unique_route_arcs,
@@ -134,13 +144,9 @@ class MapMatchingPipeline:
         trip_dir_or_id: Union[str, Path],
         with_route: bool = True
     ) -> Dict[str, Any]:
-        """
-        End-to-end trip matcher given a trip folder path or trip_id.
-        Can be directly invoked by Person 4's FastAPI endpoints.
-        """
+        """Direct entry point for Person 4 API."""
         p = Path(trip_dir_or_id)
         if not p.exists():
-            # Check train or student_test splits
             for split_dir in [config.TRAIN_DIR, config.STUDTEST_DIR]:
                 candidate_path = split_dir / p.name
                 if candidate_path.exists():
