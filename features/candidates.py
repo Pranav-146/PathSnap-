@@ -1,169 +1,104 @@
-"""
-Spatial candidate generation and geometric projection onto road network arcs.
+"""Candidate-arc generation and feature engineering for one trip.
 
-Provides:
-  - candidates_for_trip: for each GPS observation, retrieves nearby candidate road arcs
-    within radius R (default 50 m) and keeps at most k nearest.
-  - Computes perpendicular distance, projection ratio, along-arc points, and headings.
-"""
+candidates_for_trip(trip) needs NO ground truth, so the API can call it at inference time.
+Labels are attached separately (features/build_features.py) from data_processing/labels.py.
 
-from typing import Dict, List, Optional
+Pipeline per trip:
+  1. Bounding box of every arc -> STRtree (spatial index; some trips have ~300k arcs).
+  2. For each GPS point, query arcs whose box intersects the point +/- radius.
+  3. Exact point-to-segment distance in metres; keep arcs within `radius`.
+  4. Keep the K nearest per point (candidate set).
+  5. Add per-candidate features.
+"""
 import numpy as np
 import pandas as pd
-from scipy.spatial import KDTree
+import shapely
 
 import config
+from data_processing.geometry import (angle_diff_deg, arc_endpoints, bearing_deg, point_seg)
+
+MAX_SPEED = 60.0  # m/s cap on the GPS speed feature (guards against huge-gap artefacts)
 
 
-class CandidateGenerator:
-    """Fast spatial index for querying road network arcs near GPS observations."""
+def raw_candidates(trip, radius=config.RADIUS_M, k=config.K_MAX):
+    """Nearest-K arcs within `radius` metres for every GPS point.
 
-    def __init__(self, nodes: pd.DataFrame, arcs: pd.DataFrame):
-        self.nodes = nodes
-        self.arcs = arcs
-
-        # Node coordinates in UTM metres (EPSG:32632)
-        node_x = nodes["x"].to_numpy(dtype=np.float64)
-        node_y = nodes["y"].to_numpy(dtype=np.float64)
-
-        u = arcs["u"].to_numpy(dtype=np.int64)
-        v = arcs["v"].to_numpy(dtype=np.int64)
-
-        self.ax = node_x[u]
-        self.ay = node_y[u]
-        self.bx = node_x[v]
-        self.by = node_y[v]
-
-        self.dx = self.bx - self.ax
-        self.dy = self.by - self.ay
-        self.len_sq = self.dx ** 2 + self.dy ** 2
-        self.len_sq = np.where(self.len_sq == 0, 1e-9, self.len_sq)
-        self.arc_lengths = np.sqrt(self.len_sq)
-
-        # Arc midpoints for fast KD-Tree spatial filtering
-        mid_x = (self.ax + self.bx) * 0.5
-        mid_y = (self.ay + self.by) * 0.5
-        self.kdtree = KDTree(np.column_stack([mid_x, mid_y]))
-
-        # Arc headings in radians [-pi, pi]
-        self.arc_headings = np.arctan2(self.dy, self.dx)
-
-    def get_candidates_for_point(
-        self,
-        px: float,
-        py: float,
-        heading_gps: Optional[float] = None,
-        radius: float = config.RADIUS_M,
-        k: int = config.K_MAX,
-    ) -> List[Dict]:
-        """
-        Find candidate arcs within search radius from GPS point (px, py).
-        Returns list of candidate dicts sorted by perpendicular distance.
-        """
-        # Search radius plus half max road segment length to ensure coverage
-        search_r = radius + 150.0
-        candidate_indices = self.kdtree.query_ball_point([px, py], r=search_r)
-
-        if not candidate_indices:
-            # Fallback to nearest arc if search ball is empty
-            _, nearest_idx = self.kdtree.query([px, py], k=1)
-            candidate_indices = [nearest_idx]
-
-        cand_arr = np.array(candidate_indices, dtype=np.int64)
-
-        ax = self.ax[cand_arr]
-        ay = self.ay[cand_arr]
-        dx = self.dx[cand_arr]
-        dy = self.dy[cand_arr]
-        len_sq = self.len_sq[cand_arr]
-
-        # Orthogonal projection factor t: clamped to [0, 1]
-        t = ((px - ax) * dx + (py - ay) * dy) / len_sq
-        t_clamped = np.clip(t, 0.0, 1.0)
-
-        # Projected point coordinates on segment
-        proj_x = ax + t_clamped * dx
-        proj_y = ay + t_clamped * dy
-
-        # Perpendicular distance in metres
-        dists = np.hypot(px - proj_x, py - proj_y)
-
-        # Filter by actual radius
-        within_r_mask = dists <= radius
-        if not np.any(within_r_mask):
-            # If none within radius, keep the single closest candidate
-            best_idx = np.argmin(dists)
-            valid_indices = np.array([best_idx])
-        else:
-            valid_indices = np.where(within_r_mask)[0]
-
-        # Sort by distance and take top k
-        sorted_order = valid_indices[np.argsort(dists[valid_indices])][:k]
-
-        candidates = []
-        for rank, idx in enumerate(sorted_order):
-            arc_id = int(cand_arr[idx])
-            d = float(dists[idx])
-            tau = float(t_clamped[idx])
-            arc_heading = float(self.arc_headings[arc_id])
-
-            h_diff = 0.0
-            if heading_gps is not None:
-                # Heading difference in [-pi, pi]
-                diff = arc_heading - heading_gps
-                h_diff = (diff + np.pi) % (2 * np.pi) - np.pi
-
-            candidates.append({
-                "arc_id": arc_id,
-                "dist": d,
-                "dist_rank": rank,
-                "proj_frac": tau,
-                "proj_x": float(proj_x[idx]),
-                "proj_y": float(proj_y[idx]),
-                "arc_len": float(self.arc_lengths[arc_id]),
-                "heading_diff": float(h_diff),
-            })
-
-        return candidates
-
-
-def candidates_for_trip(
-    track: pd.DataFrame,
-    nodes: pd.DataFrame,
-    arcs: pd.DataFrame,
-    radius: float = config.RADIUS_M,
-    k: int = config.K_MAX,
-) -> List[List[Dict]]:
+    Returns DataFrame[obs_idx, arc_id, dist, proj_frac, dist_rank, n_cands, dist_minus_min].
     """
-    Generate candidate arcs for every GPS point in a trip.
+    ax, ay, bx, by = arc_endpoints(trip)
+    px, py = trip["track"].x.to_numpy(), trip["track"].y.to_numpy()
 
-    Returns:
-        List of candidate lists, length = len(track).
-    """
-    generator = CandidateGenerator(nodes, arcs)
+    arc_boxes = shapely.box(np.minimum(ax, bx), np.minimum(ay, by),
+                            np.maximum(ax, bx), np.maximum(ay, by))
+    tree = shapely.STRtree(arc_boxes)
+    pt_boxes = shapely.box(px - radius, py - radius, px + radius, py + radius)
+    pi, ai = tree.query(pt_boxes)          # (point index, arc index) pairs, boxes intersect
 
-    track_x = track["x"].to_numpy(dtype=np.float64)
-    track_y = track["y"].to_numpy(dtype=np.float64)
-    n_pts = len(track)
+    d, frac = point_seg(px[pi], py[pi], ax[ai], ay[ai], bx[ai], by[ai])
+    keep = d <= radius
+    df = pd.DataFrame({"obs_idx": pi[keep], "arc_id": ai[keep], "dist": d[keep], "proj_frac": frac[keep]})
+    return restrict(df, radius, k)
 
-    # Estimate GPS heading from successive points
-    headings = np.zeros(n_pts, dtype=np.float64)
-    if n_pts > 1:
-        dx = np.diff(track_x)
-        dy = np.diff(track_y)
-        h = np.arctan2(dy, dx)
-        headings[:-1] = h
-        headings[-1] = h[-1]
 
-    candidates_by_point = []
-    for i in range(n_pts):
-        cands = generator.get_candidates_for_point(
-            track_x[i],
-            track_y[i],
-            heading_gps=headings[i],
-            radius=radius,
-            k=k,
-        )
-        candidates_by_point.append(cands)
+def restrict(df, radius, k):
+    """Re-cut an existing candidate table to a smaller radius / K (recomputes the rank columns)."""
+    df = df[df.dist <= radius].sort_values(["obs_idx", "dist", "arc_id"]).copy()
+    df["dist_rank"] = df.groupby("obs_idx").cumcount()
+    df = df[df.dist_rank < k].copy()
+    g = df.groupby("obs_idx")["dist"]
+    df["n_cands"] = g.transform("size")
+    df["dist_minus_min"] = df["dist"] - g.transform("min")
+    return df.reset_index(drop=True)
 
-    return candidates_by_point
+
+def add_features(trip, cand):
+    """Attach point-level and candidate-level features to a raw candidate table."""
+    tr = trip["track"]
+    px, py, t = tr.x.to_numpy(), tr.y.to_numpy(), tr.t.to_numpy()
+    n = len(tr)
+
+    # --- point-level: GPS heading, speed and time gap, from the neighbouring points ---
+    prev_i = np.clip(np.arange(n) - 1, 0, n - 1)
+    next_i = np.clip(np.arange(n) + 1, 0, n - 1)
+    dx, dy = px[next_i] - px[prev_i], py[next_i] - py[prev_i]
+    dt_span = np.maximum(t[next_i] - t[prev_i], 1e-6)
+    pts = pd.DataFrame({
+        "obs_idx": np.arange(n),
+        "gps_heading": bearing_deg(dx, dy),
+        "speed": np.minimum(np.hypot(dx, dy) / dt_span, MAX_SPEED),
+        "dt_prev": np.r_[0.0, np.diff(t)],
+    })
+
+    df = cand.merge(pts, on="obs_idx", how="left")
+
+    # --- arc-level: length, bearing, endpoints ---
+    ax, ay, bx, by = arc_endpoints(trip)
+    a = df.arc_id.to_numpy()
+    df["arc_len"] = np.hypot(bx[a] - ax[a], by[a] - ay[a])
+    df["arc_bearing"] = bearing_deg(bx[a] - ax[a], by[a] - ay[a])
+    df["heading_diff"] = angle_diff_deg(df.gps_heading.to_numpy(), df.arc_bearing.to_numpy())
+    df["u"] = trip["arcs"].u.to_numpy()[a]
+    df["v"] = trip["arcs"].v.to_numpy()[a]
+
+    # --- connectivity to the previous point's nearest candidate ---
+    nearest = df[df.dist_rank == 0].set_index("obs_idx")[["arc_id", "u", "v"]]
+    prev = nearest.reindex(np.arange(n)).shift(1)          # NaN where unavailable
+    prev.columns = ["p_arc", "p_u", "p_v"]
+    df = df.merge(prev, left_on="obs_idx", right_index=True, how="left")
+    shares_node = (df.u == df.p_u) | (df.u == df.p_v) | (df.v == df.p_u) | (df.v == df.p_v)
+    df["connected_to_prev_nearest"] = ((df.arc_id == df.p_arc) | shares_node).astype(np.int8)
+    df = df.drop(columns=["p_arc", "p_u", "p_v"])
+
+    # --- identifiers (keep first so the parquet reads naturally) ---
+    df.insert(0, "trip_id", trip["trip_id"])
+    df.insert(2, "t", t[df.obs_idx.to_numpy()])
+    df.insert(3, "lon", tr.lon.to_numpy()[df.obs_idx.to_numpy()])
+    df.insert(4, "lat", tr.lat.to_numpy()[df.obs_idx.to_numpy()])
+    df.insert(5, "x", px[df.obs_idx.to_numpy()])
+    df.insert(6, "y", py[df.obs_idx.to_numpy()])
+    return df
+
+
+def candidates_for_trip(trip, radius=config.RADIUS_M, k=config.K_MAX):
+    """Full candidate table with features for one trip. Uses no ground-truth information."""
+    return add_features(trip, raw_candidates(trip, radius, k))
