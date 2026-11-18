@@ -19,6 +19,15 @@ from data_processing.geometry import (angle_diff_deg, arc_endpoints, bearing_deg
 
 MAX_SPEED = 60.0  # m/s cap on the GPS speed feature (guards against huge-gap artefacts)
 
+# Single source of truth for the classifier's input columns, in this exact order.
+# Model training (models/) and inference (hmm/pipeline.py, api/) must both use this list,
+# so a model is never scored on a different feature set than it was trained on.
+# Everything else in the candidate table is an identifier, a raw position or a helper column.
+FEATURE_COLS = [
+    "dist", "dist_rank", "dist_minus_min", "proj_frac", "arc_len",
+    "heading_diff", "speed", "dt_prev", "n_cands", "connected_to_prev_nearest",
+]
+
 
 def raw_candidates(trip, radius=config.RADIUS_M, k=config.K_MAX):
     """Nearest-K arcs within `radius` metres for every GPS point.
