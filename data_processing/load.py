@@ -16,15 +16,19 @@ from pyproj import Transformer
 import config
 
 
-@lru_cache(maxsize=1)
-def _transformer():
-    # always_xy=True -> input order is (lon, lat), output (x_east, y_north) in metres
-    return Transformer.from_crs("EPSG:4326", config.CRS, always_xy=True)
+@lru_cache(maxsize=256)
+def _transformer(lon0, lat0):
+    # Local azimuthal-equidistant projection centred on the trip: distances from the
+    # centre are true metres, and the error is negligible over a trip's extent.
+    # (The dataset spans several countries, so one global UTM zone would be wrong.)
+    crs = f"+proj=aeqd +lat_0={lat0} +lon_0={lon0} +datum=WGS84 +units=m +no_defs"
+    return Transformer.from_crs("EPSG:4326", crs, always_xy=True)
 
 
-def project(lon, lat):
-    """lon/lat degrees -> UTM metres (x, y). Euclidean distance on these is in metres."""
-    x, y = _transformer().transform(np.asarray(lon, float), np.asarray(lat, float))
+def project(lon, lat, center):
+    """lon/lat degrees -> local metres (x east, y north) around center=(lon0, lat0)."""
+    lon0, lat0 = round(float(center[0]), 4), round(float(center[1]), 4)
+    x, y = _transformer(lon0, lat0).transform(np.asarray(lon, float), np.asarray(lat, float))
     return np.asarray(x), np.asarray(y)
 
 
@@ -44,10 +48,13 @@ def load_trip(trip_dir, with_route=True):
     nodes = _read(trip_dir / f"{tid}.nodes", ["lon", "lat"], float)
     arcs = _read(trip_dir / f"{tid}.arcs", ["u", "v"], np.int64)
 
-    track["x"], track["y"] = project(track.lon, track.lat)
-    nodes["x"], nodes["y"] = project(nodes.lon, nodes.lat)
+    # Centre of the local projection comes from the GPS track only (no ground truth used).
+    center = (float(track.lon.mean()), float(track.lat.mean()))
+    track["x"], track["y"] = project(track.lon, track.lat, center)
+    nodes["x"], nodes["y"] = project(nodes.lon, nodes.lat, center)
 
-    trip = {"trip_id": tid, "dir": trip_dir, "track": track, "nodes": nodes, "arcs": arcs}
+    trip = {"trip_id": tid, "dir": trip_dir, "track": track, "nodes": nodes, "arcs": arcs,
+            "center": center}
     route_path = trip_dir / f"{tid}.route"
     if with_route and route_path.exists():
         trip["route"] = _read(route_path, ["arc"], np.int64)["arc"].to_numpy()

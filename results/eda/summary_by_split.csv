@@ -1,0 +1,11 @@
+,student_test,train
+trips,10.0,80.0
+points_total,19160.0,208417.0
+points_median,1420.0,1529.0
+points_max,3958.0,19313.0
+arcs_median,13145.0,19526.5
+arcs_max,56027.0,307392.0
+route_len_median,250.0,280.0
+trips_with_gap_gt_60s,1.0,22.0
+trips_multi_component,10.0,79.0
+isolated_nodes_total,0.0,0.0
