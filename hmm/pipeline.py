@@ -3,6 +3,7 @@ End-to-end Map Matching Pipeline integrating candidate extraction,
 classifier scoring hook, and HMM/Viterbi sequence decoding.
 """
 
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 import numpy as np
@@ -10,7 +11,7 @@ import pandas as pd
 
 import config
 from data_processing.load import load_trip
-from features.candidates import candidates_for_trip
+from features.candidates import FEATURE_COLS, candidates_for_trip
 from hmm.graph import RoadGraph
 from hmm.viterbi import ViterbiDecoder
 
@@ -87,18 +88,25 @@ class MapMatchingPipeline:
 
         # 4. Score candidates with classifier if available
         clf_scores_by_step = None
+        classifier_used = False
         if self.classifier is not None and not cand_df.empty:
-            # Person 2 classifier scoring hook
+            # Person 2 classifier scoring hook. Uses the shared FEATURE_COLS list (the same
+            # columns the model was trained on). A failure is reported loudly and recorded in
+            # the result, never swallowed, so a distance-only run cannot pass as classifier + HMM.
             try:
-                feature_cols = [c for c in cand_df.columns if c not in ["trip_id", "obs_idx", "t", "lon", "lat", "x", "y", "arc_id", "u", "v", "label"]]
-                probs = self.classifier.predict_proba(cand_df[feature_cols])[:, 1]
+                probs = self.classifier.predict_proba(cand_df[FEATURE_COLS])[:, 1]
                 cand_df["clf_score"] = probs
                 clf_scores_by_step = [[] for _ in range(n_pts)]
                 for row in cand_df.itertuples(index=False):
                     obs_idx = int(row.obs_idx)
                     if obs_idx < n_pts:
                         clf_scores_by_step[obs_idx].append(float(row.clf_score))
-            except Exception:
+                classifier_used = True
+            except Exception as exc:
+                warnings.warn(
+                    f"Classifier scoring FAILED for trip {trip_data['trip_id']}: {exc!r}. "
+                    "Falling back to distance-only emissions; results are NOT classifier + HMM.",
+                    RuntimeWarning, stacklevel=2)
                 clf_scores_by_step = None
 
         # 5. Run Viterbi Decoder
@@ -128,6 +136,7 @@ class MapMatchingPipeline:
 
         return {
             "trip_id": trip_data["trip_id"],
+            "classifier_used": classifier_used,
             "road_graph": rg,
             "track": track,
             "candidate_df": cand_df,
