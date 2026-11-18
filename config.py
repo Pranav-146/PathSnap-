@@ -13,8 +13,9 @@ EVAL_DIR = Path(os.environ.get("PATHSNAP_EVAL_DIR", STUDTEST_DIR))
 RESULTS_DIR = ROOT / "results"
 ARTIFACTS_DIR = ROOT / "artifacts"
 
-# Projected CRS: UTM zone 32N (metres). Data is around 8.6E, 49.8N (Germany).
-CRS = "EPSG:32632"
+# Coordinates are projected per trip with a local azimuthal-equidistant projection centred
+# on the trip's GPS track (see data_processing/load.py). The dataset spans several countries
+# (e.g. Germany ~8.6E 49.8N and Vietnam ~106.7E 15.3N), so no single UTM zone fits all trips.
 
 RADIUS_M = 50      # candidate search radius (tuned via candidate miss rate)
 K_MAX = 8          # max candidates per GPS point
